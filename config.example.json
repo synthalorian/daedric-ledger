@@ -1,0 +1,7 @@
+{
+  "token": "PASTE_BOT_TOKEN_HERE",
+  "watch_channel_ids": [1234567890123456789],
+  "items_file": "data/items.json",
+  "db_file": "data/ledger.db",
+  "lookback_days": 90
+}
