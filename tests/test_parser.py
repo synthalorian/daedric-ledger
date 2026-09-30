@@ -134,16 +134,35 @@ def test_ledger_dedupes(tmp_path):
 
 def test_official_prices_and_audit(tmp_path):
     led = Ledger(tmp_path / "t.db")
-    led.set_price("Iron Sword", 10, 25, "admin", 42)
-    led.set_price("Iron Sword", 12, 30, "admin", 42)
-    row = led.get_price("Iron Sword")
-    assert row["buy"] == 12 and row["sell"] == 30
-    hist = led.price_history_for("Iron Sword")
-    assert len(hist) == 2  # both changes in the audit trail
-    assert hist[0]["buy"] == 12  # newest first
-    assert led.remove_price("Iron Sword") is True
-    assert led.get_price("Iron Sword") is None
-    assert led.remove_price("Iron Sword") is False
+    led.set_price(1, "Guild A", "Iron Sword", 10, 25, "admin", 42)
+    led.set_price(1, "Guild A", "Iron Sword", 12, 30, "admin", 42)
+    led.set_price(2, "Guild B", "Iron Sword", 18, 40, "other", 7)
+
+    avg = led.average_price("Iron Sword")
+    assert avg["avg_buy"] == pytest.approx(15)   # (12 + 18) / 2 — one vote per server
+    assert avg["avg_sell"] == pytest.approx(35)
+    assert avg["n_servers"] == 2
+    assert len(avg["servers"]) == 2
+
+    # guild A only sees its own row
+    rows = led.get_prices("Iron Sword")
+    assert len(rows) == 2
+    hist_a = led.price_history_for("Iron Sword", guild_id=1)
+    assert len(hist_a) == 2 and hist_a[0]["buy"] == 12  # newest first, guild-scoped
+    hist_all = led.price_history_for("Iron Sword")
+    assert len(hist_all) == 3
+
+    # removal is guild-scoped
+    assert led.remove_price(1, "Iron Sword") is True
+    assert led.average_price("Iron Sword")["n_servers"] == 1
+    assert led.remove_price(1, "Iron Sword") is False
+
+    # board aggregation
+    led.set_price(1, "Guild A", "Ebony Ingot", 200, 392, "admin", 42)
+    board = led.board_prices()
+    names = {r["item_name"] for r in board}
+    assert "Ebony Ingot" in names and "Iron Sword" in names
+
     # kv store
     led.kv_set("board_message_id", "999")
     assert led.kv_get("board_message_id") == "999"

@@ -38,19 +38,24 @@ CREATE TABLE IF NOT EXISTS unmatched (
     raw_message   TEXT NOT NULL
 );
 
--- Official (admin-set) prices: the backbone of the ledger.
+-- Official (admin-set) prices, PER SERVER: each guild keeps its own books.
+-- The cross-server average is computed from these rows.
 CREATE TABLE IF NOT EXISTS prices (
-    item_name     TEXT PRIMARY KEY,
+    guild_id      INTEGER NOT NULL,
+    guild_name    TEXT NOT NULL DEFAULT '',
+    item_name     TEXT NOT NULL,
     buy           REAL,                 -- what the crown/store pays
     sell          REAL,                 -- what the crown/store charges
     set_by        TEXT NOT NULL,
     set_by_id     INTEGER NOT NULL,
-    ts            INTEGER NOT NULL
+    ts            INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, item_name)
 );
 
--- Full audit trail: every price change, who did it, when.
+-- Full audit trail: every price change, who did it, when, in which server.
 CREATE TABLE IF NOT EXISTS price_history (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id      INTEGER NOT NULL,
     item_name     TEXT NOT NULL,
     buy           REAL,
     sell          REAL,
@@ -69,7 +74,7 @@ CREATE TABLE IF NOT EXISTS kv (
 
 
 class Ledger:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, legacy_guild_id: int = 0, legacy_guild_name: str = ""):
         # check_same_thread=False: discord.py handlers offload DB calls via
         # asyncio.to_thread. The lock serializes writers.
         self.conn = sqlite3.connect(str(path), check_same_thread=False)
@@ -78,6 +83,30 @@ class Ledger:
         with self._lock:
             self.conn.executescript(SCHEMA)
             self.conn.commit()
+            self._migrate(legacy_guild_id, legacy_guild_name)
+
+    def _migrate(self, legacy_guild_id: int, legacy_guild_name: str) -> None:
+        """v1 -> v2: global prices table gains guild_id. Existing rows are
+        attributed to the home guild (the server that ran the bot first)."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(prices)")}
+        if "guild_id" in cols or not cols:
+            return
+        self.conn.execute("ALTER TABLE prices RENAME TO prices_v1")
+        self.conn.execute("ALTER TABLE price_history RENAME TO price_history_v1")
+        self.conn.executescript(SCHEMA)
+        self.conn.execute(
+            """INSERT INTO prices (guild_id, guild_name, item_name, buy, sell, set_by, set_by_id, ts)
+               SELECT ?, ?, item_name, buy, sell, set_by, set_by_id, ts FROM prices_v1""",
+            (legacy_guild_id, legacy_guild_name),
+        )
+        self.conn.execute(
+            """INSERT INTO price_history (guild_id, item_name, buy, sell, set_by, set_by_id, ts)
+               SELECT ?, item_name, buy, sell, set_by, set_by_id, ts FROM price_history_v1""",
+            (legacy_guild_id,),
+        )
+        self.conn.execute("DROP TABLE prices_v1")
+        self.conn.execute("DROP TABLE price_history_v1")
+        self.conn.commit()
 
     def record(
         self,
@@ -154,43 +183,79 @@ class Ledger:
             (limit,),
         ).fetchall()
 
-    # --- official prices ----------------------------------------------------
+    # --- official prices (per-guild, cross-server averaged) -----------------
 
-    def set_price(self, item_name: str, buy: float | None, sell: float | None,
+    def set_price(self, guild_id: int, guild_name: str, item_name: str,
+                  buy: float | None, sell: float | None,
                   set_by: str, set_by_id: int) -> None:
         ts = int(time.time())
         with self._lock:
             self.conn.execute(
-                """INSERT INTO prices (item_name, buy, sell, set_by, set_by_id, ts)
-                   VALUES (?,?,?,?,?,?)
-                   ON CONFLICT(item_name) DO UPDATE SET
+                """INSERT INTO prices (guild_id, guild_name, item_name, buy, sell, set_by, set_by_id, ts)
+                   VALUES (?,?,?,?,?,?,?,?)
+                   ON CONFLICT(guild_id, item_name) DO UPDATE SET
+                       guild_name=excluded.guild_name,
                        buy=excluded.buy, sell=excluded.sell,
                        set_by=excluded.set_by, set_by_id=excluded.set_by_id, ts=excluded.ts""",
-                (item_name, buy, sell, set_by, set_by_id, ts),
+                (guild_id, guild_name, item_name, buy, sell, set_by, set_by_id, ts),
             )
             self.conn.execute(
-                "INSERT INTO price_history (item_name, buy, sell, set_by, set_by_id, ts) VALUES (?,?,?,?,?,?)",
-                (item_name, buy, sell, set_by, set_by_id, ts),
+                """INSERT INTO price_history (guild_id, item_name, buy, sell, set_by, set_by_id, ts)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (guild_id, item_name, buy, sell, set_by, set_by_id, ts),
             )
             self.conn.commit()
 
-    def remove_price(self, item_name: str) -> bool:
+    def remove_price(self, guild_id: int, item_name: str) -> bool:
         with self._lock:
-            cur = self.conn.execute("DELETE FROM prices WHERE item_name = ?", (item_name,))
+            cur = self.conn.execute(
+                "DELETE FROM prices WHERE guild_id = ? AND item_name = ?",
+                (guild_id, item_name),
+            )
             self.conn.commit()
         return cur.rowcount > 0
 
-    def get_price(self, item_name: str) -> sqlite3.Row | None:
+    def get_prices(self, item_name: str) -> list[sqlite3.Row]:
+        """Every server's official price for one item."""
         return self.conn.execute(
-            "SELECT * FROM prices WHERE item_name = ?", (item_name,),
-        ).fetchone()
-
-    def all_prices(self) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM prices ORDER BY item_name",
+            "SELECT * FROM prices WHERE item_name = ? ORDER BY guild_name",
+            (item_name,),
         ).fetchall()
 
-    def price_history_for(self, item_name: str, limit: int = 10) -> list[sqlite3.Row]:
+    def average_price(self, item_name: str) -> dict | None:
+        """Cross-server average: mean buy / mean sell across all guilds
+        reporting a price. Each server counts once — no whale server can
+        dominate by listing more items."""
+        rows = self.get_prices(item_name)
+        if not rows:
+            return None
+        buys = [r["buy"] for r in rows if r["buy"] is not None]
+        sells = [r["sell"] for r in rows if r["sell"] is not None]
+        return {
+            "item_name": item_name,
+            "avg_buy": sum(buys) / len(buys) if buys else None,
+            "avg_sell": sum(sells) / len(sells) if sells else None,
+            "n_servers": len({r["guild_id"] for r in rows}),
+            "servers": [(r["guild_name"], r["buy"], r["sell"]) for r in rows],
+        }
+
+    def board_prices(self) -> list[sqlite3.Row]:
+        """One row per item: cross-server average + reporting server count."""
+        return self.conn.execute(
+            """SELECT item_name,
+                      AVG(buy) AS avg_buy, AVG(sell) AS avg_sell,
+                      COUNT(DISTINCT guild_id) AS n_servers,
+                      MAX(ts) AS last_change
+               FROM prices GROUP BY item_name ORDER BY item_name"""
+        ).fetchall()
+
+    def price_history_for(self, item_name: str, guild_id: int | None = None,
+                          limit: int = 10) -> list[sqlite3.Row]:
+        if guild_id is not None:
+            return self.conn.execute(
+                "SELECT * FROM price_history WHERE item_name = ? AND guild_id = ? ORDER BY ts DESC LIMIT ?",
+                (item_name, guild_id, limit),
+            ).fetchall()
         return self.conn.execute(
             "SELECT * FROM price_history WHERE item_name = ? ORDER BY ts DESC LIMIT ?",
             (item_name, limit),

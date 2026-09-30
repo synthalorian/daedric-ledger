@@ -46,13 +46,33 @@ def load_config() -> dict:
 
 CFG = load_config()
 items = ItemDB.load(Path(__file__).parent / CFG.get("items_file", "data/items.json"))
-ledger = Ledger(Path(__file__).parent / CFG.get("db_file", "data/ledger.db"))
+ledger = Ledger(
+    Path(__file__).parent / CFG.get("db_file", "data/ledger.db"),
+    legacy_guild_id=CFG.get("home_guild_id", 0),
+    legacy_guild_name=CFG.get("home_guild_name", ""),
+)
 WATCH_CHANNELS: set[int] = set(CFG.get("watch_channel_ids", []))
 LOOKBACK_DAYS: int = CFG.get("lookback_days", 90)
 ADMIN_ROLE_IDS: set[int] = set(CFG.get("admin_role_ids", []))
 # Where the daily price board lives (defaults to first watch channel)
 BOARD_CHANNEL_ID: int | None = CFG.get("board_channel_id") or (WATCH_CHANNELS and next(iter(WATCH_CHANNELS)))
 LISTEN_ENABLED: bool = CFG.get("listen_to_trade_chat", True)
+
+# Item type -> board category
+CATEGORIES: list[tuple[str, set[str]]] = [
+    ("Weapons", {"WEAP"}),
+    ("Armor & Clothing", {"ARMO"}),
+    ("Materials & Misc", {"MISC", "KEYM", "LIGH"}),
+    ("Ingredients", {"INGR"}),
+    ("Potions & Poisons", {"ALCH"}),
+    ("Soul Gems", {"SLGM"}),
+    ("Scrolls", {"SCRL"}),
+    ("Ammunition", {"AMMO"}),
+    ("Books & Notes", {"BOOK"}),
+]
+_TYPE_TO_CAT: dict[str, str] = {t: name for name, types in CATEGORIES for t in types}
+_NAME_TO_TYPE: dict[str, str] = {it.name: it.type for it in items.items}
+PAGE_SIZE = 20
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -81,34 +101,122 @@ def is_admin(inter: discord.Interaction) -> bool:
     return bool(role_ids & ADMIN_ROLE_IDS)
 
 
-# --- price board ------------------------------------------------------------
+# --- price board (categorized + paginated) -----------------------------------
 
-async def render_board() -> str:
-    rows = await asyncio.to_thread(ledger.all_prices)
-    if not rows:
-        return "**OFFICIAL PRICE BOARD**\n_No prices set yet. Admins: `/setprice`._"
-    lines = ["**OFFICIAL PRICE BOARD**", f"_Updated <t:{int(time.time())}:R>_", "",
-             "```", f"{'ITEM':<32} {'BUY':>8} {'SELL':>8}", "─" * 50]
+def _category_of(item_name: str) -> str:
+    return _TYPE_TO_CAT.get(_NAME_TO_TYPE.get(item_name, ""), "Materials & Misc")
+
+
+async def _board_rows() -> dict[str, list]:
+    """Board data grouped by category: {category: [rows]}."""
+    rows = await asyncio.to_thread(ledger.board_prices)
+    grouped: dict[str, list] = {}
     for r in rows:
-        lines.append(f"{r['item_name'][:32]:<32} {fmt_gold(r['buy']):>8} {fmt_gold(r['sell']):>8}")
+        grouped.setdefault(_category_of(r["item_name"]), []).append(r)
+    return grouped
+
+
+def render_board_page(grouped: dict[str, list], category: str, page: int) -> tuple[str, int]:
+    """Render one page. Returns (text, total_pages)."""
+    rows = grouped.get(category, [])
+    total_pages = max(1, (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    lines = [f"**OFFICIAL PRICE BOARD — {category}**",
+             f"_Cross-server averages • Updated <t:{int(time.time())}:R>_", "",
+             "```", f"{'ITEM':<30} {'BUY':>7} {'SELL':>7} {'SRV':>4}", "─" * 50]
+    for r in chunk:
+        lines.append(
+            f"{r['item_name'][:30]:<30} {fmt_gold(r['avg_buy']):>7} {fmt_gold(r['avg_sell']):>7}"
+            f" {r['n_servers']:>4}"
+        )
+    if not chunk:
+        lines.append("(nothing priced in this category yet)")
     lines.append("```")
-    text = "\n".join(lines)
-    if len(text) > 2000:  # Discord message cap — split later if it ever grows
-        text = text[:1990] + "\n…```"
-    return text
+    lines.append(f"_Page {page + 1}/{total_pages} • SRV = servers reporting_")
+    return "\n".join(lines), total_pages
+
+
+class BoardView(discord.ui.View):
+    """Persistent view: category dropdown + page buttons."""
+
+    def __init__(self, category: str | None = None, page: int = 0):
+        super().__init__(timeout=None)
+        self.category = category
+        self.page = page
+        # category select is rebuilt per render (options depend on data);
+        # buttons carry fixed custom_ids so the view survives restarts.
+
+    async def _render(self, interaction: discord.Interaction):
+        grouped = await _board_rows()
+        if self.category is None or self.category not in grouped:
+            self.category = next((c for c, _ in CATEGORIES if c in grouped), "Materials & Misc")
+        text, total = render_board_page(grouped, self.category, self.page)
+        view = BoardView(self.category, self.page)
+        view.rebuild(grouped, total)
+        await interaction.response.edit_message(content=text, view=view)
+
+    def rebuild(self, grouped: dict[str, list], total_pages: int):
+        self.clear_items()
+        cats = [c for c, _ in CATEGORIES if c in grouped]
+        if cats:
+            select = discord.ui.Select(
+                placeholder="Category",
+                custom_id="ledger:board:cat",
+                options=[discord.SelectOption(label=c, value=c,
+                                              default=(c == self.category)) for c in cats],
+            )
+
+            async def on_cat(inter: discord.Interaction):
+                self.category = select.values[0]
+                self.page = 0
+                await self._render(inter)
+
+            select.callback = on_cat
+            self.add_item(select)
+
+        async def on_prev(inter: discord.Interaction):
+            self.page -= 1
+            await self._render(inter)
+
+        async def on_next(inter: discord.Interaction):
+            self.page += 1
+            await self._render(inter)
+
+        prev_btn = discord.ui.Button(label="◀ Prev", custom_id="ledger:board:prev",
+                                     disabled=self.page <= 0)
+        next_btn = discord.ui.Button(label="Next ▶", custom_id="ledger:board:next",
+                                     disabled=self.page >= total_pages - 1)
+        prev_btn.callback = on_prev
+        next_btn.callback = on_next
+        self.add_item(prev_btn)
+        self.add_item(next_btn)
+
+
+async def render_board_message() -> tuple[str, BoardView]:
+    grouped = await _board_rows()
+    if not any(grouped.values()):
+        return ("**OFFICIAL PRICE BOARD**\n_No prices set yet. Admins: `/setprice`._",
+                BoardView())
+    first_cat = next((c for c, _ in CATEGORIES if c in grouped), "Materials & Misc")
+    text, total = render_board_page(grouped, first_cat, 0)
+    view = BoardView(first_cat, 0)
+    view.rebuild(grouped, total)
+    return text, view
 
 
 async def update_board(channel: discord.TextChannel) -> None:
-    text = await render_board()
+    text, view = await render_board_message()
     msg_id = ledger.kv_get("board_message_id")
     if msg_id:
         try:
             msg = await channel.fetch_message(int(msg_id))
-            await msg.edit(content=text)
+            await msg.edit(content=text, view=view)
             return
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
-    msg = await channel.send(text)
+    msg = await channel.send(text, view=view)
     ledger.kv_set("board_message_id", str(msg.id))
     try:
         await msg.pin()
@@ -135,6 +243,7 @@ async def _wait_ready():
 
 @client.event
 async def on_ready():
+    client.add_view(BoardView())  # re-register persistent board buttons
     await tree.sync()
     if not daily_board.is_running():
         daily_board.start()
@@ -189,13 +298,19 @@ async def price_cmd(inter: discord.Interaction, item: str):
         await inter.followup.send(f"Couldn't resolve **{item}**. Closest: {sugg}")
         return
 
-    official = await asyncio.to_thread(ledger.get_price, match.item.name)
-    if official is not None:
-        e = discord.Embed(title=f"{match.item.name} — official price")
-        e.add_field(name="Buy (store pays)", value=fmt_gold(official["buy"]), inline=True)
-        e.add_field(name="Sell (store charges)", value=fmt_gold(official["sell"]), inline=True)
-        when = f"<t:{official['ts']}:R>"
-        e.set_footer(text=f"Set by {official['set_by']} {when} — see the pinned price board")
+    avg = await asyncio.to_thread(ledger.average_price, match.item.name)
+    if avg is not None:
+        e = discord.Embed(title=f"{match.item.name} — cross-server average")
+        e.add_field(name="Avg buy (stores pay)", value=fmt_gold(avg["avg_buy"]), inline=True)
+        e.add_field(name="Avg sell (stores charge)", value=fmt_gold(avg["avg_sell"]), inline=True)
+        e.add_field(name="Servers reporting", value=str(avg["n_servers"]), inline=True)
+        if avg["n_servers"] > 1:
+            breakdown = "\n".join(
+                f"**{name or 'unknown'}** — buy {fmt_gold(b)} / sell {fmt_gold(s)}"
+                for name, b, s in avg["servers"]
+            )
+            e.add_field(name="Per-server", value=breakdown[:1024], inline=False)
+        e.set_footer(text="Official prices set by each server's admins • /pricehistory for the audit trail")
         await inter.followup.send(embed=e)
         return
 
@@ -238,7 +353,10 @@ async def setprice_cmd(inter: discord.Interaction, item: str, buy: float | None 
         sugg = ", ".join(n for n, _ in match.candidates[:3]) or "no close names"
         await inter.response.send_message(f"Couldn't resolve **{item}**. Closest: {sugg}", ephemeral=True)
         return
-    await asyncio.to_thread(ledger.set_price, match.item.name, buy, sell,
+    await asyncio.to_thread(ledger.set_price,
+                            inter.guild_id or 0,
+                            inter.guild.name if inter.guild else "DM",
+                            match.item.name, buy, sell,
                             str(inter.user), inter.user.id)
     await inter.response.send_message(
         f"✅ **{match.item.name}** — buy {fmt_gold(buy)} / sell {fmt_gold(sell)} (logged)")
@@ -258,7 +376,7 @@ async def removeprice_cmd(inter: discord.Interaction, item: str):
         return
     match = items.match(item)
     name = match.item.name if match.item else item
-    removed = await asyncio.to_thread(ledger.remove_price, name)
+    removed = await asyncio.to_thread(ledger.remove_price, inter.guild_id or 0, name)
     if removed:
         await inter.response.send_message(f"🗑 Removed official price for **{name}**.")
     else:
@@ -272,7 +390,7 @@ async def pricehistory_cmd(inter: discord.Interaction, item: str):
     if match.item is None:
         await inter.response.send_message(f"Couldn't resolve **{item}**.", ephemeral=True)
         return
-    rows = await asyncio.to_thread(ledger.price_history_for, match.item.name)
+    rows = await asyncio.to_thread(ledger.price_history_for, match.item.name, inter.guild_id)
     if not rows:
         await inter.response.send_message(f"No official price history for **{match.item.name}**.")
         return

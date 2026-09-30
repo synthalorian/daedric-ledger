@@ -85,6 +85,8 @@ def main() -> None:
 
     items = ItemDB.load(Path(__file__).parent.parent / CFG.get("items_file", "data/items.json"))
     ledger = Ledger(Path(__file__).parent.parent / CFG.get("db_file", "data/ledger.db"))
+    guild_id = CFG.get("home_guild_id", 0)
+    guild_name = CFG.get("home_guild_name", "")
 
     msgs = fetch_all_messages(args.channel)
     print(f"fetched {len(msgs)} messages")
@@ -101,7 +103,8 @@ def main() -> None:
                 continue
             print(f"  {canonical}: buy {buy} sell {sell}  (from {author})")
             if not args.dry_run:
-                ledger.set_price(canonical, buy, sell, f"{author} (sheet import)", 0)
+                ledger.set_price(guild_id, guild_name, canonical, buy, sell,
+                                 f"{author} (sheet import)", 0)
             imported += 1
 
     print(f"\n{'would import' if args.dry_run else 'imported'} {imported} prices, skipped {skipped}")
