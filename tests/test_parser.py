@@ -130,3 +130,21 @@ def test_ledger_dedupes(tmp_path):
     assert led.record(**kw) is True
     assert led.record(**kw) is False  # duplicate snowflake rejected
     led.close()
+
+
+def test_official_prices_and_audit(tmp_path):
+    led = Ledger(tmp_path / "t.db")
+    led.set_price("Iron Sword", 10, 25, "admin", 42)
+    led.set_price("Iron Sword", 12, 30, "admin", 42)
+    row = led.get_price("Iron Sword")
+    assert row["buy"] == 12 and row["sell"] == 30
+    hist = led.price_history_for("Iron Sword")
+    assert len(hist) == 2  # both changes in the audit trail
+    assert hist[0]["buy"] == 12  # newest first
+    assert led.remove_price("Iron Sword") is True
+    assert led.get_price("Iron Sword") is None
+    assert led.remove_price("Iron Sword") is False
+    # kv store
+    led.kv_set("board_message_id", "999")
+    assert led.kv_get("board_message_id") == "999"
+    led.close()

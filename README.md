@@ -35,12 +35,25 @@ scopes and View Channels / Read Message History permissions.
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `/price <item>` | Decay-weighted average (sell ask / buy bid / midpoint) with sample size |
-| `/history <item>` | Last 10 recorded offers |
-| `/top` | Most traded items, 7 days |
-| `/unmatched` | (admin) Item texts the matcher couldn't resolve — feed these into aliases |
+| Command | Who | What it does |
+|---|---|---|
+| `/price <item>` | everyone | Official price (buy/sell) if set; falls back to trade-chat average |
+| `/history <item>` | everyone | Last 10 recorded trade-chat offers |
+| `/top` | everyone | Most traded items, 7 days |
+| `/pricehistory <item>` | everyone | Audit trail of official price changes (who/when/what) |
+| `/setprice <item> [buy] [sell]` | admins | Set official price — logged to the audit trail, board auto-refreshes |
+| `/removeprice <item>` | admins | Remove an official price |
+| `/board` | admins | Force-post/refresh the pinned price board |
+| `/unmatched` | admins | Item texts the matcher couldn't resolve — feed these into aliases |
+
+"Admins" = Manage Server permission, or any role in `admin_role_ids` in config.json.
+
+## Price board
+
+The bot keeps a single **pinned, self-editing price board** message in the
+board channel (default: first watch channel). It updates on every `/setprice`
+and re-renders every 24 hours. `tools/import_sheets.py` seeds official prices
+from admin-posted price sheets already in the channel.
 
 ## Design notes
 
