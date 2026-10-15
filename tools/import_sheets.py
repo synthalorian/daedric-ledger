@@ -14,7 +14,7 @@ buy/sell prices, and are skipped.
 
 Uses REST only (no gateway) so it's safe to run while the bot is live.
 
-    python tools/import_sheets.py --channel 1550350919240261724 [--dry-run]
+    python tools/import_sheets.py --channel <CHANNEL_ID> [--dry-run]
 """
 
 from __future__ import annotations
